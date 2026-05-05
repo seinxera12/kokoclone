@@ -1,0 +1,4 @@
+# file: /home/seinxera12/robotic_robo/kokoclone/core/logging_setup.py
+# hypothesis_version: 6.152.4
+
+['%Y-%m-%d %H:%M:%S', '..', 'kokoclone.log', 'utf-8']

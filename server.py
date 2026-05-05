@@ -21,6 +21,7 @@ Endpoints:
 import logging
 import os
 import tempfile
+import uuid
 
 import soundfile as sf
 import uvicorn
@@ -28,8 +29,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [KokoClone-svc] %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
+from core.logging_setup import get_kokoclone_logger
+
+logger = get_kokoclone_logger("server")
 
 app = FastAPI(title="KokoClone TTS Service")
 
@@ -61,24 +63,27 @@ def synthesize(req: SynthesizeRequest):
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         tmp_path = f.name
 
+    request_id = uuid.uuid4().hex[:8]
+
     try:
-        logger.info(f"Synthesising [{req.lang}]: {req.text[:80]!r}")
+        logger.info(f"request_received text={req.text[:80]!r} lang={req.lang!r} request_id={request_id} text_len={len(req.text)}")
         cloner.generate(
             text=req.text,
             lang=req.lang,
             reference_audio=req.reference_audio,
             output_path=tmp_path,
+            request_id=request_id,
         )
 
         # Read the WAV bytes directly — no need to decode with soundfile
         with open(tmp_path, "rb") as f:
             wav_bytes = f.read()
 
-        logger.info(f"Done — {len(wav_bytes)} bytes")
+        logger.info(f"request_complete request_id={request_id} response_bytes={len(wav_bytes)}")
         return Response(content=wav_bytes, media_type="audio/wav")
 
     except Exception as exc:
-        logger.error(f"Synthesis failed: {exc}", exc_info=True)
+        logger.error(f"request_failed request_id={request_id} exc_type={type(exc).__name__} message={exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
         if os.path.exists(tmp_path):

@@ -6,6 +6,10 @@ import tempfile
 import time
 import types
 
+from core.logging_setup import get_kokoclone_logger
+
+_logger = get_kokoclone_logger("cloner")
+
 import numpy as np
 import torch
 import soundfile as sf
@@ -199,7 +203,7 @@ class KokoClone:
 
         return model_file, voices_file, vocab, g2p, voice, en_callable
 
-    def generate(self, text, lang, reference_audio, output_path="output.wav"):
+    def generate(self, text, lang, reference_audio, output_path="output.wav", request_id=""):
         """Generates the speech and applies the target voice."""
         model_file, voices_file, vocab, g2p, voice, en_callable = self._get_config(lang)
         
@@ -210,12 +214,16 @@ class KokoClone:
         
         kokoro = self.kokoro_cache[model_file]
         
-        print(f"Synthesizing text ({lang.upper()})...")
+        _logger.info(f"synthesizing lang={lang.upper()} request_id={request_id}")
+        _t0 = time.perf_counter()
         if g2p:
             phonemes, _ = g2p(text)
             samples, sr = kokoro.create(phonemes, voice=voice, speed=1.0, is_phonemes=True)
         else:
             samples, sr = kokoro.create(text, voice=voice, speed=0.9, lang="en-us")
+        _kokoro_elapsed = time.perf_counter() - _t0
+        _audio_duration = len(samples) / sr
+        _logger.info(f"phase=kokoro_tts request_id={request_id} elapsed_seconds={_kokoro_elapsed:.3f} audio_duration_seconds={_audio_duration:.3f} lang={lang}")
 
         # Use a secure temporary file for the base audio
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
@@ -224,22 +232,32 @@ class KokoClone:
 
         # 2. Kanade Voice Conversion Phase
         try:
-            print("Applying Voice Clone...")
+            _logger.info(f"applying_voice_clone request_id={request_id}")
             # Load and push to device
             source_wav = load_audio(temp_path, sample_rate=self.sample_rate).to(self.device)
             ref_wav = load_audio(reference_audio, sample_rate=self.sample_rate).to(self.device)
 
+            _t1 = time.perf_counter()
             with torch.inference_mode():
                 converted_wav = chunked_voice_conversion(
                     kanade=self.kanade,
                     vocoder_model=self.vocoder,
                     source_wav=source_wav,
                     ref_wav=ref_wav,
-                    sample_rate=self.sample_rate
+                    sample_rate=self.sample_rate,
+                    request_id=request_id
                 )
+            _vc_elapsed = time.perf_counter() - _t1
+            _vc_duration = converted_wav.shape[-1] / self.sample_rate
+            _logger.info(f"phase=kanade_vc request_id={request_id} elapsed_seconds={_vc_elapsed:.3f} audio_duration_seconds={_vc_duration:.3f}")
 
             sf.write(output_path, converted_wav.numpy(), self.sample_rate)
-            print(f"Success! Saved: {output_path}")
+            _logger.info(f"phase=total request_id={request_id} total_elapsed_seconds={(_kokoro_elapsed + _vc_elapsed):.3f}")
+            _logger.info(f"saved output_path={output_path} request_id={request_id}")
+
+        except Exception as exc:
+            _logger.error(f"phase=kanade_vc request_id={request_id} exc_type={type(exc).__name__} message={exc}", exc_info=True)
+            raise
 
         finally:
             if os.path.exists(temp_path):

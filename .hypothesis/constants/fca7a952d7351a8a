@@ -1,0 +1,4 @@
+# file: /home/seinxera12/robotic_robo/kokoclone/core/chunked_convert.py
+# hypothesis_version: 6.152.4
+
+[0.5, 0.75, 0.9, 5.0, 10.0, 12.5, 256, 1024, 'chunked_convert', 'cuda']

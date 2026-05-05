@@ -38,6 +38,9 @@ from __future__ import annotations
 import time
 import torch
 from kanade_tokenizer import vocode
+from core.logging_setup import get_kokoclone_logger
+
+_logger = get_kokoclone_logger("chunked_convert")
 
 
 # Empirical constant: ~10 seconds of audio fit in 1 GB of VRAM budget for the
@@ -69,6 +72,7 @@ def chunked_voice_conversion(
     ref_wav: torch.Tensor,
     sample_rate: int,
     vram_fraction: float = 0.9,
+    request_id: str = "",
 ) -> torch.Tensor:
     """Convert *source_wav* to the reference voice in VRAM-safe chunks.
 
@@ -118,12 +122,7 @@ def chunked_voice_conversion(
         chunk_samples = min(vram_chunk_samples, rope_safe_chunk)
         chunk_seconds = chunk_samples / sample_rate
 
-        print(
-            f"[chunked_convert] VRAM budget: {budget_gb:.2f} GB "
-            f"({vram_fraction*100:.0f}% of {total_vram_bytes / (1024**3):.2f} GB) "
-            f"→ chunk size: {chunk_seconds:.1f}s / {chunk_samples:,} samples "
-            f"(RoPE ceiling: {rope_safe_seconds:.1f}s)"
-        )
+        _logger.info(f"chunk_config request_id={request_id} vram_budget_gb={budget_gb:.2f} vram_fraction={vram_fraction:.0%} total_vram_gb={total_vram_bytes / (1024**3):.2f} chunk_seconds={chunk_seconds:.1f} chunk_samples={chunk_samples} rope_ceiling_seconds={rope_safe_seconds:.1f}")
     else:
         # CPU: no VRAM limit, but still respect the RoPE ceiling for quality.
         chunk_samples = rope_safe_chunk
@@ -131,12 +130,14 @@ def chunked_voice_conversion(
     # ── 2. Short-circuit when the whole file fits in one chunk ───────────────
     if n_samples <= chunk_samples:
         with torch.inference_mode():
+            _chunk_t0 = time.perf_counter()
             mel = kanade.voice_conversion(
                 source_waveform=source_wav, reference_waveform=ref_wav
             )
             wav = vocode(vocoder_model, mel.unsqueeze(0))
+        chunk_index = 0
         elapsed = time.perf_counter() - _start
-        print(f"[chunked_convert] Completed in {elapsed:.1f}s")
+        _logger.info(f"chunked_convert_complete request_id={request_id} elapsed_seconds={elapsed:.3f} n_chunks={chunk_index + 1}")
         return wav.squeeze().cpu()
 
     # ── 3. Chunked processing with overlap ──────────────────────────────────
@@ -146,6 +147,7 @@ def chunked_voice_conversion(
 
     mel_parts: list[torch.Tensor] = []
     pos = 0
+    chunk_index = 0
 
     while pos < n_samples:
         # Extend the window on both sides by overlap_samples so the model has
@@ -156,12 +158,15 @@ def chunked_voice_conversion(
         chunk = source_wav[..., win_start:win_end]
 
         with torch.inference_mode():
+            _chunk_t0 = time.perf_counter()
             mel_chunk: torch.Tensor = kanade.voice_conversion(
                 source_waveform=chunk, reference_waveform=ref_wav
             )
 
         # Move to CPU immediately so the GPU buffer is freed before the next chunk.
         mel_chunk = mel_chunk.cpu()
+        _logger.info(f"chunk request_id={request_id} chunk_index={chunk_index} chunk_duration_s={(win_end - win_start) / sample_rate:.2f} elapsed_s={time.perf_counter() - _chunk_t0:.3f}")
+        chunk_index += 1
 
         # Trim overlap frames that were only there for context.
         left_trim  = 0 if pos == 0 else overlap_frames
@@ -181,5 +186,5 @@ def chunked_voice_conversion(
         wav = vocode(vocoder_model, full_mel.unsqueeze(0))
 
     elapsed = time.perf_counter() - _start
-    print(f"[chunked_convert] Completed in {elapsed:.1f}s")
+    _logger.info(f"chunked_convert_complete request_id={request_id} elapsed_seconds={elapsed:.3f} n_chunks={chunk_index + 1}")
     return wav.squeeze().cpu()

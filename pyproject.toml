@@ -19,5 +19,11 @@ dependencies = [
 [tool.uv.sources]
 kanade-tokenizer = { git = "https://github.com/frothywater/kanade-tokenizer" }
 
+[dependency-groups]
+dev = [
+    "hypothesis>=6.152.4",
+    "pytest>=9.0.3",
+]
+
 [tool.uv]
 no-build-isolation-package = ["flash-attn"]

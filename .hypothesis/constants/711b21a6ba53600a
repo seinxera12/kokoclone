@@ -1,0 +1,4 @@
+# file: /home/seinxera12/robotic_robo/kokoclone/core/cloner.py
+# hypothesis_version: 6.152.4
+
+[0.9, 1.0, '([a-zA-Z]+)', '-m', '.', '.wav', '1.1', 'af_bella', 'config-v1.1-zh.json', 'config.json', 'cpu', 'cuda', 'download', 'en', 'en-us', 'es', 'ff_siwis', 'fr', 'fr-fr', 'hf_alpha', 'hi', 'im_nicola', 'input_ids', 'it', 'ja', 'jf_alpha', 'kokoro-v1.1-zh.onnx', 'kokoro.onnx', 'kokoro_onnx', 'model', 'output.wav', 'pf_dora', 'pt', 'pt-br', 'speed', 'style', 'tensor(float)', 'unidic', 'utf-8', 'vocab', 'voice', 'voices-v1.0.bin', 'voices-v1.1-zh.bin', 'zf_001', 'zh']
