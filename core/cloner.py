@@ -35,8 +35,15 @@ class KokoClone:
         self.vocoder = load_vocoder(self.kanade.config.vocoder_name).to(self.device)
         self.sample_rate = self.kanade.config.sample_rate
         
-        # Cache for Kokoro
+        # Cache for Kokoro ONNX sessions (keyed by model file path)
         self.kokoro_cache = {}
+
+        # Cache for Kanade reference (speaker) embeddings, keyed by absolute
+        # reference audio path.  Encoding the reference wav is the most
+        # expensive part of the VC pipeline (~0.3–1 s on GPU); caching it
+        # means every request after the first one for a given reference file
+        # skips that work entirely.
+        self._ref_embedding_cache: dict[str, torch.Tensor] = {}
 
     def _get_vocab_config(self, lang):
         """Return a vocab config path compatible with the selected language/model."""
@@ -203,6 +210,46 @@ class KokoClone:
 
         return model_file, voices_file, vocab, g2p, voice, en_callable
 
+    def precompute_reference(self, reference_audio: str) -> torch.Tensor:
+        """Encode *reference_audio* into a speaker embedding and cache it.
+
+        The embedding is keyed by the absolute, normalised file path so that
+        any subsequent call to :meth:`generate` or :meth:`convert` with the
+        same path reuses the cached tensor without re-reading or re-encoding
+        the file.
+
+        Parameters
+        ----------
+        reference_audio:
+            Path to the reference WAV file.
+
+        Returns
+        -------
+        torch.Tensor
+            The global (speaker) embedding tensor of shape ``(dim,)`` on the
+            model's device.
+        """
+        key = os.path.realpath(reference_audio)
+        if key not in self._ref_embedding_cache:
+            _logger.info(f"precompute_reference path={reference_audio!r} — encoding and caching")
+            ref_wav = load_audio(reference_audio, sample_rate=self.sample_rate).to(self.device)
+            with torch.inference_mode():
+                ref_features = self.kanade.encode(ref_wav, return_content=False, return_global=True)
+            self._ref_embedding_cache[key] = ref_features.global_embedding
+            _logger.info(f"precompute_reference path={reference_audio!r} — cached embedding shape={ref_features.global_embedding.shape}")
+        else:
+            _logger.info(f"precompute_reference path={reference_audio!r} — already cached, skipping")
+        return self._ref_embedding_cache[key]
+
+    def _get_ref_embedding(self, reference_audio: str) -> torch.Tensor:
+        """Return the cached speaker embedding for *reference_audio*, computing
+        it on first access.  This is the internal helper used by
+        :meth:`generate` and :meth:`convert`."""
+        key = os.path.realpath(reference_audio)
+        if key not in self._ref_embedding_cache:
+            self.precompute_reference(reference_audio)
+        return self._ref_embedding_cache[key]
+
     def generate(self, text, lang, reference_audio, output_path="output.wav", request_id=""):
         """Generates the speech and applies the target voice."""
         model_file, voices_file, vocab, g2p, voice, en_callable = self._get_config(lang)
@@ -233,9 +280,14 @@ class KokoClone:
         # 2. Kanade Voice Conversion Phase
         try:
             _logger.info(f"applying_voice_clone request_id={request_id}")
-            # Load and push to device
+            # Load source audio and push to device
             source_wav = load_audio(temp_path, sample_rate=self.sample_rate).to(self.device)
-            ref_wav = load_audio(reference_audio, sample_rate=self.sample_rate).to(self.device)
+
+            # Retrieve (or compute-and-cache) the reference speaker embedding.
+            # The reference wav is encoded only once per unique file path; all
+            # subsequent requests reuse the cached global embedding tensor,
+            # saving ~0.3–1 s of GPU work per request.
+            ref_emb = self._get_ref_embedding(reference_audio)
 
             _t1 = time.perf_counter()
             with torch.inference_mode():
@@ -243,9 +295,10 @@ class KokoClone:
                     kanade=self.kanade,
                     vocoder_model=self.vocoder,
                     source_wav=source_wav,
-                    ref_wav=ref_wav,
+                    ref_wav=None,           # not needed — embedding is pre-computed
                     sample_rate=self.sample_rate,
-                    request_id=request_id
+                    request_id=request_id,
+                    ref_embedding=ref_emb,
                 )
             _vc_elapsed = time.perf_counter() - _t1
             _vc_duration = converted_wav.shape[-1] / self.sample_rate
@@ -266,17 +319,17 @@ class KokoClone:
     def convert(self, source_audio, reference_audio, output_path="output.wav"):
         """Re-voices source_audio to sound like reference_audio using chunking."""
         print("Applying Voice Conversion...")
-        # Load and push to device
         source_wav = load_audio(source_audio, sample_rate=self.sample_rate).to(self.device)
-        ref_wav = load_audio(reference_audio, sample_rate=self.sample_rate).to(self.device)
+        ref_emb = self._get_ref_embedding(reference_audio)
 
         with torch.inference_mode():
             converted_wav = chunked_voice_conversion(
                 kanade=self.kanade,
                 vocoder_model=self.vocoder,
                 source_wav=source_wav,
-                ref_wav=ref_wav,
-                sample_rate=self.sample_rate
+                ref_wav=None,
+                sample_rate=self.sample_rate,
+                ref_embedding=ref_emb,
             )
 
         sf.write(output_path, converted_wav.numpy(), self.sample_rate)

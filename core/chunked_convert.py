@@ -69,10 +69,11 @@ def chunked_voice_conversion(
     kanade,
     vocoder_model,
     source_wav: torch.Tensor,
-    ref_wav: torch.Tensor,
+    ref_wav: torch.Tensor | None,
     sample_rate: int,
     vram_fraction: float = 0.9,
     request_id: str = "",
+    ref_embedding: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Convert *source_wav* to the reference voice in VRAM-safe chunks.
 
@@ -87,17 +88,24 @@ def chunked_voice_conversion(
         device as *kanade*.
     ref_wav:
         Reference waveform tensor of shape ``[T]`` or ``[1, T]``, on the same
-        device as *kanade*.
+        device as *kanade*.  May be ``None`` when *ref_embedding* is provided.
     sample_rate:
         Audio sample rate in Hz (taken from ``kanade.config.sample_rate``).
     vram_fraction:
-        Fraction of total VRAM to target per chunk.  Default ``0.5`` → 50 %.
+        Fraction of total VRAM to target per chunk.  Default ``0.9`` → 90 %.
+    ref_embedding:
+        Optional pre-computed global (speaker) embedding tensor of shape
+        ``[dim]``, already on the correct device.  When supplied, *ref_wav* is
+        ignored and the embedding is reused directly — avoiding a redundant
+        reference-audio encode on every request.
 
     Returns
     -------
     torch.Tensor
         Converted waveform as a 1-D CPU float32 tensor.
     """
+    if ref_embedding is None and ref_wav is None:
+        raise ValueError("Either ref_wav or ref_embedding must be provided.")
     device: torch.device = source_wav.device
     n_samples: int = source_wav.shape[-1]
     _start = time.perf_counter()
@@ -127,12 +135,27 @@ def chunked_voice_conversion(
         # CPU: no VRAM limit, but still respect the RoPE ceiling for quality.
         chunk_samples = rope_safe_chunk
 
-    # ── 2. Short-circuit when the whole file fits in one chunk ───────────────
+    # ── 2. Resolve reference global embedding ───────────────────────────────
+    # Encode the reference audio once if a pre-computed embedding was not
+    # supplied.  This is the expensive step that we want to avoid repeating
+    # across requests that share the same reference wav.
+    if ref_embedding is None:
+        with torch.inference_mode():
+            ref_features = kanade.encode(ref_wav, return_content=False, return_global=True)
+            ref_embedding = ref_features.global_embedding  # shape: (dim,)
+        _logger.info(f"ref_embedding_computed request_id={request_id} (no cache hit)")
+    else:
+        _logger.info(f"ref_embedding_reused request_id={request_id} (cache hit)")
+
+    # ── 3. Short-circuit when the whole file fits in one chunk ───────────────
     if n_samples <= chunk_samples:
         with torch.inference_mode():
             _chunk_t0 = time.perf_counter()
-            mel = kanade.voice_conversion(
-                source_waveform=source_wav, reference_waveform=ref_wav
+            source_features = kanade.encode(source_wav, return_content=True, return_global=False)
+            mel = kanade.decode(
+                content_embedding=source_features.content_embedding,
+                global_embedding=ref_embedding,
+                target_audio_length=source_wav.shape[-1],
             )
             wav = vocode(vocoder_model, mel.unsqueeze(0))
         chunk_index = 0
@@ -140,7 +163,7 @@ def chunked_voice_conversion(
         _logger.info(f"chunked_convert_complete request_id={request_id} elapsed_seconds={elapsed:.3f} n_chunks={chunk_index + 1}")
         return wav.squeeze().cpu()
 
-    # ── 3. Chunked processing with overlap ──────────────────────────────────
+    # ── 4. Chunked processing with overlap ──────────────────────────────────
     # Mel frames corresponding to the overlap window.
     # The mel output is at sample_rate / hop_length = 93.75 fps, NOT _MEL_FPS.
     overlap_frames = overlap_samples // _MEL_HOP_LENGTH  # 12000 // 256 = 46
@@ -159,8 +182,11 @@ def chunked_voice_conversion(
 
         with torch.inference_mode():
             _chunk_t0 = time.perf_counter()
-            mel_chunk: torch.Tensor = kanade.voice_conversion(
-                source_waveform=chunk, reference_waveform=ref_wav
+            source_features = kanade.encode(chunk, return_content=True, return_global=False)
+            mel_chunk: torch.Tensor = kanade.decode(
+                content_embedding=source_features.content_embedding,
+                global_embedding=ref_embedding,
+                target_audio_length=chunk.shape[-1],
             )
 
         # Move to CPU immediately so the GPU buffer is freed before the next chunk.
