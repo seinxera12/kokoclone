@@ -88,6 +88,10 @@ def _split_sentences_ja(text: str) -> list[str]:
     Strips leading/trailing whitespace and blank lines.  Sentences shorter
     than 2 characters are merged into the next one to avoid Kokoro artifacts
     on very short utterances.
+
+    Also filters out sentences that are purely URLs or source citations
+    (e.g. "この情報は...：https://...") since the Japanese G2P cannot handle
+    raw URLs and they add no value when spoken aloud.
     """
     # Normalise newlines and split on sentence-ending punctuation
     parts = re.split(r'(?<=[。！？…!?])\s*', text.strip())
@@ -109,7 +113,45 @@ def _split_sentences_ja(text: str) -> list[str]:
         else:
             merged.append(carry)
 
-    return merged if merged else [text.strip()]
+    # Filter sentences that contain a URL — the Japanese G2P crashes on
+    # raw URLs and they are meaningless when spoken aloud.
+    filtered = [s for s in merged if not re.search(r'https?://', s)]
+
+    return filtered if filtered else (merged if merged else [text.strip()])
+
+
+def _sanitize_for_g2p(text: str) -> str:
+    """
+    Clean text before passing to the Japanese G2P (misaki/cutlet).
+
+    misaki's cutlet crashes with AssertionError on bare digit tokens
+    (e.g. "10", "2024") because it tries to romanise them as words.
+    Replace standalone digit sequences with their Japanese reading so
+    the G2P never sees a raw number.
+
+    Also strips any residual URLs that slipped through sentence filtering.
+    """
+    # Remove URLs entirely
+    text = re.sub(r'https?://\S+', '', text)
+
+    # Convert standalone digit sequences to kanji numerals.
+    # Simple single/double digit mapping covers the common cases.
+    # Longer numbers are rare in conversational TTS text.
+    _digit_map = {
+        '0': 'ゼロ', '1': '一', '2': '二', '3': '三', '4': '四',
+        '5': '五', '6': '六', '7': '七', '8': '八', '9': '九',
+        '10': '十', '11': '十一', '12': '十二', '13': '十三',
+        '14': '十四', '15': '十五', '16': '十六', '17': '十七',
+        '18': '十八', '19': '十九', '20': '二十', '30': '三十',
+        '40': '四十', '50': '五十', '100': '百', '1000': '千',
+    }
+
+    def _replace_digits(m: re.Match) -> str:
+        n = m.group(0)
+        return _digit_map.get(n, n)  # fall back to original if not in map
+
+    text = re.sub(r'\b\d+\b', _replace_digits, text)
+    return text.strip()
 
 
 def _numpy_to_wav_bytes(samples: np.ndarray, sample_rate: int) -> bytes:
@@ -143,12 +185,19 @@ async def _synthesize_sentence(
     # ── Kokoro TTS (blocking, run in thread) ────────────────────────────────
     _tts_t0 = time.perf_counter()
 
+    # Sanitize before G2P: remove URLs and convert bare digits to kanji so
+    # misaki/cutlet doesn't crash with AssertionError on digit tokens.
+    clean_sentence = _sanitize_for_g2p(sentence)
+    if not clean_sentence:
+        logger.info(f"[{label}] sentence empty after sanitization, skipping")
+        return None
+
     def _run_kokoro():
         if g2p:
-            phonemes, _ = g2p(sentence)
+            phonemes, _ = g2p(clean_sentence)
             return kokoro.create(phonemes, voice=voice, speed=1.0, is_phonemes=True)
         else:
-            return kokoro.create(sentence, voice=voice, speed=0.9, lang="en-us")
+            return kokoro.create(clean_sentence, voice=voice, speed=0.9, lang="en-us")
 
     try:
         audio_chunk, sr = await loop.run_in_executor(None, _run_kokoro)
@@ -314,6 +363,11 @@ async def synthesize_stream(req: SynthesizeRequest):
             if wav_bytes:
                 frame = struct.pack("<I", len(wav_bytes)) + wav_bytes
                 yield frame
+                # Yield control to the event loop so uvicorn flushes the send
+                # buffer immediately.  Without this, uvicorn may hold the frame
+                # in its internal buffer until the next chunk is ready or the
+                # response ends — adding seconds of unnecessary delay.
+                await asyncio.sleep(0)
                 chunks_yielded += 1
                 elapsed = time.perf_counter() - _t_start
                 logger.info(
